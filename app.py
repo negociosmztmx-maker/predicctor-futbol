@@ -1,203 +1,290 @@
 import streamlit as st
 import pandas as pd
 from scipy.stats import poisson
+import requests
 import glob
 
-# --- CONFIGURACIÓN DE LA PÁGINA ---
+# --- CONFIGURACIÓN GLOBAL ---
 st.set_page_config(
-    page_title="Predicctor Pro de Fútbol", 
+    page_title="Predicctor Pro (Hybrid)", 
     page_icon="⚽", 
     layout="wide"
 )
 
-# --- CAPA 1: LÓGICA DEL NEGOCIO (MODELO) ---
-
+# --- CAPA 1: MOTOR MATEMÁTICO (CORE) ---
 class PredictorFutbol:
-    """Encargado de los cálculos matemáticos de probabilidad y valor."""
+    """Cerebro matemático: Poisson y Kelly."""
     
-    def calcular_probabilidad_partido(self, lamb_home: float, lamb_away: float) -> dict:
+    def calcular_probabilidades(self, lamb_home, lamb_away):
         prob_local, prob_empate, prob_visitante = 0.0, 0.0, 0.0
-        # Iteramos resultados posibles (0-0 hasta 9-9)
+        # Iteramos marcadores probables (0-0 a 9-9)
         for i in range(10):
             for j in range(10):
-                p = poisson.pmf(i, lamb_home) * poisson.pmf(j, lamb_away)
-                if i > j: prob_local += p
-                elif i == j: prob_empate += p
-                else: prob_visitante += p
+                weight = poisson.pmf(i, lamb_home) * poisson.pmf(j, lamb_away)
+                if i > j: prob_local += weight
+                elif i == j: prob_empate += weight
+                else: prob_visitante += weight
         return {"local": prob_local, "empate": prob_empate, "visitante": prob_visitante}
 
-    def analizar_valor(self, prob_real: float, cuota: float) -> tuple:
-        """Calcula si hay valor esperado positivo (EV)."""
+    def analizar_valor(self, prob_real, cuota):
+        """Calcula Valor Esperado (EV)."""
         if cuota <= 1.0: return "N/A", 0.0
         ev = (prob_real * cuota) - 1
         etiqueta = "✅ SI" if ev > 0 else "⛔ NO"
         return etiqueta, ev * 100
 
-class AnalizadorLiga:
-    """Maneja los datos históricos, limpieza y estadísticas."""
-    
-    def __init__(self, df):
-        self.df = df
-        self._limpiar()
+def convertir_cuota(valor):
+    """Detecta y convierte cuotas Americanas a Decimales."""
+    if valor < 0: return (100 / abs(valor)) + 1 # Americana Negativa (-110)
+    elif valor >= 10: return (valor / 100) + 1  # Americana Positiva (+200)
+    return valor # Decimal normal
 
-    def _limpiar(self):
-        # Estandarizamos nombres de columnas clave
-        cols = {
-            'HomeTeam': 'local', 'AwayTeam': 'visitante', 
+# --- CAPA 2: INGESTIÓN DE DATOS (ETL) ---
+
+@st.cache_data(ttl=3600) # Cache de 1 hora para no saturar la API
+def cargar_desde_api(liga_code):
+    """Conecta a football-data.org y devuelve un DataFrame limpio."""
+    try:
+        api_key = st.secrets["FOOTBALL_API_KEY"]
+    except FileNotFoundError:
+        return None, "❌ Falta configurar .streamlit/secrets.toml"
+    except KeyError:
+        return None, "❌ La clave FOOTBALL_API_KEY no está en secrets.toml"
+
+    headers = {'X-Auth-Token': api_key}
+    url = f"https://api.football-data.org/v4/competitions/{liga_code}/matches?status=FINISHED"
+    
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        return None, f"Error API: {response.status_code} - {response.reason}"
+
+    data = response.json()
+    matches = data.get('matches', [])
+    
+    if not matches:
+        return None, "La API no devolvió partidos (¿Quizás la temporada apenas inicia?)"
+
+    # Normalizamos a nuestra estructura estándar
+    datos_limpios = []
+    for m in matches:
+        datos_limpios.append({
+            'local': m['homeTeam']['name'],
+            'visitante': m['awayTeam']['name'],
+            'goles_local': m['score']['fullTime']['home'],
+            'goles_visitante': m['score']['fullTime']['away']
+        })
+    
+    return pd.DataFrame(datos_limpios), "OK"
+
+def cargar_desde_csv(ruta_archivo):
+    """Carga CSV local y normaliza columnas."""
+    try:
+        df = pd.read_csv(ruta_archivo)
+        # Mapeo de nombres estándar de football-data.co.uk
+        rename_map = {
+            'HomeTeam': 'local', 'AwayTeam': 'visitante',
             'FTHG': 'goles_local', 'FTAG': 'goles_visitante'
         }
-        self.df = self.df.rename(columns=cols)
-        # Nos aseguramos de tener solo las columnas necesarias y sin nulos
-        needed = ['local', 'visitante', 'goles_local', 'goles_visitante']
-        valid_cols = self.df.columns.intersection(needed)
-        self.df = self.df[valid_cols].dropna()
+        df = df.rename(columns=rename_map)
+        # Filtramos solo lo necesario
+        required = ['local', 'visitante', 'goles_local', 'goles_visitante']
+        return df[required].dropna(), "OK"
+    except Exception as e:
+        return None, str(e)
+
+# --- CAPA 3: ANÁLISIS DE DATOS ---
+class AnalizadorLiga:
+    def __init__(self, df):
+        self.df = df # Asumimos que el DF ya viene limpio y normalizado
 
     def obtener_equipos(self):
-        return sorted(self.df['local'].unique())
+        equipos = set(self.df['local'].unique()) | set(self.df['visitante'].unique())
+        return sorted(list(equipos))
 
     def obtener_fuerzas(self):
-        # Cálculo vectorizado de fuerzas de ataque y defensa
-        media = (self.df['goles_local'].mean() + self.df['goles_visitante'].mean()) / 2
-        
-        loc = self.df.groupby('local')[['goles_local', 'goles_visitante']].mean()
-        vis = self.df.groupby('visitante')[['goles_visitante', 'goles_local']].mean()
-        
+        # Medias globales
+        mean_g_home = self.df['goles_local'].mean()
+        mean_g_away = self.df['goles_visitante'].mean()
+        media_liga_total = (mean_g_home + mean_g_away) / 2
+
+        # Agrupaciones
+        home_stats = self.df.groupby('local')[['goles_local', 'goles_visitante']].mean()
+        away_stats = self.df.groupby('visitante')[['goles_visitante', 'goles_local']].mean()
+
         equipos = pd.DataFrame()
-        # Ataque: Promedio de goles marcados / media liga
-        equipos['f_ataque'] = ((loc['goles_local'] + vis['goles_visitante']) / 2) / media
-        # Defensa: Promedio de goles recibidos / media liga
-        equipos['f_defensa'] = ((loc['goles_visitante'] + vis['goles_local']) / 2) / media
-        return equipos
-
-    def obtener_racha(self, equipo: str, n: int = 5) -> str:
-        """Analiza los últimos n partidos y devuelve iconos: ✅ ❌ ➖"""
-        filtro = (self.df['local'] == equipo) | (self.df['visitante'] == equipo)
-        partidos = self.df[filtro].tail(n) 
         
-        racha = []
-        for _, row in partidos.iterrows():
+        # Fuerza Ataque: (Goles metidos en casa + Goles metidos fuera) / 2 / media liga
+        equipos['f_ataque'] = ((home_stats['goles_local'] + away_stats['goles_visitante']) / 2) / media_liga_total
+        
+        # Fuerza Defensa: (Goles recibidos en casa + Goles recibidos fuera) / 2 / media liga
+        equipos['f_defensa'] = ((home_stats['goles_visitante'] + away_stats['goles_local']) / 2) / media_liga_total
+        
+        # Rellenar NaN con 1.0 (promedio) por si faltan datos
+        return equipos.fillna(1.0)
+
+    def obtener_racha(self, equipo, n=5):
+        # Filtro de partidos del equipo
+        mask = (self.df['local'] == equipo) | (self.df['visitante'] == equipo)
+        last_n = self.df[mask].tail(n)
+        
+        racha_iconos = []
+        for _, row in last_n.iterrows():
             es_local = row['local'] == equipo
-            goles_f = row['goles_local'] if es_local else row['goles_visitante']
-            goles_c = row['goles_visitante'] if es_local else row['goles_local']
+            gf = row['goles_local'] if es_local else row['goles_visitante']
+            gc = row['goles_visitante'] if es_local else row['goles_local']
             
-            if goles_f > goles_c: racha.append("✅")
-            elif goles_f < goles_c: racha.append("❌")
-            else: racha.append("➖")
-        
-        return " ".join(racha)
+            if gf > gc: racha_iconos.append("✅")
+            elif gf < gc: racha_iconos.append("❌")
+            else: racha_iconos.append("➖")
+            
+        return " ".join(racha_iconos) if racha_iconos else "Sin datos"
 
-def convertir_cuota(valor):
-    """Convierte cuotas Americanas a Decimales automáticamente."""
-    if valor < 0: return (100 / abs(valor)) + 1 
-    elif valor >= 10: return (valor / 100) + 1  
-    return valor 
+# --- CAPA 4: INTERFAZ DE USUARIO (GUI) ---
 
-# --- CAPA 2: INTERFAZ GRÁFICA (VISTA STREAMLIT) ---
+st.title("📡 Sistema de Predicción Híbrido")
+st.markdown("Algoritmo de **Poisson** conectado a datos en tiempo real (API) o históricos (CSV).")
 
-st.title("⚽ Sistema de Predicción Inteligente")
-st.markdown("""
-Esta herramienta utiliza la **Distribución de Poisson** para calcular probabilidades reales 
-y el criterio de **Kelly/Valor Esperado** para encontrar oportunidades de inversión.
-""")
+# --- BARRA LATERAL: SELECCIÓN DE FUENTE ---
+st.sidebar.header("Configuración de Datos")
+modo_datos = st.sidebar.radio("Fuente de Datos:", ["☁️ API (En Vivo)", "📂 CSV (Local)"])
 
-# 1. SIDEBAR
-st.sidebar.header("📂 Base de Datos")
-archivos_csv = glob.glob("*.csv")
+df_activo = None
+mensaje_status = ""
 
-if not archivos_csv:
-    st.error("⚠️ No se encontraron archivos .csv.")
-else:
-    archivo_selec = st.sidebar.selectbox("Selecciona la Liga:", archivos_csv)
+if modo_datos == "☁️ API (En Vivo)":
+    # Diccionario de ligas soportadas por el plan gratis
+    LIGAS_API = {
+        "Premier League (ING)": "PL",
+        "La Liga (ESP)": "PD",
+        "Serie A (ITA)": "SA",
+        "Bundesliga (ALE)": "BL1",
+        "Ligue 1 (FRA)": "FL1",
+        "Eredivisie (HOL)": "DED",
+        "Championship (ING 2)": "ELC",
+        "Primeira Liga (POR)": "PPL",
+        "Libertadores (SUD)": "CLI" 
+    }
+    liga_sel = st.sidebar.selectbox("Selecciona Competición:", list(LIGAS_API.keys()))
     
-    try:
-        df_raw = pd.read_csv(archivo_selec)
-        analizador = AnalizadorLiga(df_raw)
-        fuerzas = analizador.obtener_fuerzas()
-        equipos = analizador.obtener_equipos()
-        st.sidebar.success(f"Cargados {len(df_raw)} partidos.")
+    with st.spinner(f"Conectando satélites para {liga_sel}..."):
+        df_activo, mensaje = cargar_desde_api(LIGAS_API[liga_sel])
+        mensaje_status = mensaje
+
+else: # MODO CSV
+    archivos = glob.glob("*.csv")
+    if not archivos:
+        st.sidebar.error("No hay archivos .csv en la carpeta.")
+        mensaje_status = "Error: Faltan CSVs"
+    else:
+        archivo_sel = st.sidebar.selectbox("Archivo CSV:", archivos)
+        df_activo, mensaje = cargar_desde_csv(archivo_sel)
+        mensaje_status = mensaje
+
+# --- LÓGICA PRINCIPAL ---
+
+if df_activo is None or df_activo.empty:
+    st.warning(f"⚠️ No se pudieron cargar datos. Estado: {mensaje_status}")
+    if modo_datos == "☁️ API (En Vivo)":
+        st.info("💡 Consejo: Verifica que tengas el archivo `.streamlit/secrets.toml` creado con tu API Key.")
+else:
+    # Si llegamos aquí, tenemos datos limpios en df_activo
+    st.success(f"Datos cargados correctamente: {len(df_activo)} partidos procesados.")
+    
+    # Instanciamos el analizador
+    analizador = AnalizadorLiga(df_activo)
+    fuerzas = analizador.obtener_fuerzas()
+    equipos = analizador.obtener_equipos()
+
+    st.divider()
+    
+    # 1. SELECTORES DE EQUIPOS
+    col1, col2 = st.columns(2)
+    with col1:
+        local = st.selectbox("🏠 Equipo Local", equipos)
+    with col2:
+        # Quitamos al local de la lista de visitantes
+        visitante = st.selectbox("✈️ Equipo Visitante", [e for e in equipos if e != local])
+
+    # 2. CUOTAS
+    st.markdown("### 💰 Cuotas del Mercado")
+    c1, c2, c3 = st.columns(3)
+    cuota_l_raw = c1.number_input(f"Cuota {local}", 0.0, step=0.1)
+    cuota_e_raw = c2.number_input("Cuota Empate", 0.0, step=0.1)
+    cuota_v_raw = c3.number_input(f"Cuota {visitante}", 0.0, step=0.1)
+
+    # 3. BOTÓN DE ANÁLISIS
+    if st.button("🚀 Calcular Probabilidades y Valor", type="primary"):
+        predictor = PredictorFutbol()
         
-        # 2. SELECCIÓN DE EQUIPOS
-        st.subheader("1️⃣ Configuración del Partido")
-        col1, col2 = st.columns(2)
-        with col1:
-            local = st.selectbox("Equipo Local (🏠)", equipos)
-        with col2:
-            visitante = st.selectbox("Equipo Visitante (✈️)", [e for e in equipos if e != local])
+        # Obtener fuerzas (si es equipo nuevo sin datos, usamos 1.0 por defecto)
+        f_atq_l = fuerzas.loc[local, 'f_ataque'] if local in fuerzas.index else 1.0
+        f_def_l = fuerzas.loc[local, 'f_defensa'] if local in fuerzas.index else 1.0
+        f_atq_v = fuerzas.loc[visitante, 'f_ataque'] if visitante in fuerzas.index else 1.0
+        f_def_v = fuerzas.loc[visitante, 'f_defensa'] if visitante in fuerzas.index else 1.0
 
-        # 3. INPUT DE CUOTAS
-        st.subheader("2️⃣ Cuotas del Mercado")
-        c1, c2, c3 = st.columns(3)
-        cuota_l_in = c1.number_input(f"Victoria {local}", value=0.0, step=0.1)
-        cuota_e_in = c2.number_input("Empate", value=0.0, step=0.1)
-        cuota_v_in = c3.number_input(f"Victoria {visitante}", value=0.0, step=0.1)
+        # Cálculo de Lambdas (Goles Esperados)
+        # Factor Campo: 1.25 (Ventaja estadística estándar)
+        lambda_local = f_atq_l * f_def_v * 1.25
+        lambda_visitante = f_atq_v * f_def_l
 
-        # BOTÓN DE ACCIÓN
-        if st.button("🚀 ANALIZAR OPORTUNIDADES", type="primary"):
-            
-            # Cálculo de Lambdas
-            f_atq_l = fuerzas.loc[local, 'f_ataque']
-            f_def_l = fuerzas.loc[local, 'f_defensa']
-            f_atq_v = fuerzas.loc[visitante, 'f_ataque']
-            f_def_v = fuerzas.loc[visitante, 'f_defensa']
+        # Probabilidades
+        probs = predictor.calcular_probabilidades(lambda_local, lambda_visitante)
+        
+        # Conversión de Cuotas
+        od_l = convertir_cuota(cuota_l_raw)
+        od_e = convertir_cuota(cuota_e_raw)
+        od_v = convertir_cuota(cuota_v_raw)
 
-            lambda_loc = f_atq_l * f_def_v * 1.3 
-            lambda_vis = f_atq_v * f_def_l
+        # Análisis de Valor (EV)
+        tag_l, ev_l = predictor.analizar_valor(probs['local'], od_l)
+        tag_e, ev_e = predictor.analizar_valor(probs['empate'], od_e)
+        tag_v, ev_v = predictor.analizar_valor(probs['visitante'], od_v)
 
-            predictor = PredictorFutbol()
-            probs = predictor.calcular_probabilidad_partido(lambda_loc, lambda_vis)
-            
-            odds_l = convertir_cuota(cuota_l_in)
-            odds_e = convertir_cuota(cuota_e_in)
-            odds_v = convertir_cuota(cuota_v_in)
+        # Rachas
+        racha_l = analizador.obtener_racha(local)
+        racha_v = analizador.obtener_racha(visitante)
 
-            dec_l, val_l = predictor.analizar_valor(probs['local'], odds_l)
-            dec_e, val_e = predictor.analizar_valor(probs['empate'], odds_e)
-            dec_v, val_v = predictor.analizar_valor(probs['visitante'], odds_v)
+        # --- RESULTADOS VISUALES ---
+        st.divider()
+        
+        # Encabezado Rachas
+        st.subheader("🔥 Momentum")
+        rc1, rc2 = st.columns(2)
+        rc1.info(f"**{local}**: {racha_l}")
+        rc2.info(f"**{visitante}**: {racha_v}")
 
-            racha_l = analizador.obtener_racha(local)
-            racha_v = analizador.obtener_racha(visitante)
+        # Métricas
+        st.subheader("📊 Métricas (Ataque/Defensa)")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Ataque Local", f"{f_atq_l:.2f}")
+        m2.metric("Defensa Local", f"{f_def_l:.2f}", delta_color="inverse")
+        m3.metric("Ataque Visita", f"{f_atq_v:.2f}")
+        m4.metric("Defensa Visita", f"{f_def_v:.2f}", delta_color="inverse")
 
-            # --- RESULTADOS VISUALES ---
-            st.divider()
-            
-            # RACHAS
-            st.markdown("### 🔥 Forma Reciente (Últimos 5)")
-            col_r1, col_r2 = st.columns(2)
-            col_r1.info(f"**{local}**: {racha_l}")
-            col_r2.info(f"**{visitante}**: {racha_v}")
+        # Tabla Final
+        st.subheader("🏆 Decisión de Inversión")
+        datos_tabla = {
+            "Resultado": [local, "Empate", visitante],
+            "Prob. Real": [f"{probs['local']*100:.1f}%", f"{probs['empate']*100:.1f}%", f"{probs['visitante']*100:.1f}%"],
+            "Cuota (Dec)": [f"{od_l:.2f}", f"{od_e:.2f}", f"{od_v:.2f}"],
+            "Valor (EV)": [f"{ev_l:.2f}%", f"{ev_e:.2f}%", f"{ev_v:.2f}%"],
+            "¿Apostar?": [tag_l, tag_e, tag_v]
+        }
+        
+        df_res = pd.DataFrame(datos_tabla)
+        
+        # Estilos condicionales
+        def colorear(val):
+            if "✅" in str(val): return 'background-color: #d4edda; color: black'
+            if "⛔" in str(val): return 'background-color: #f8d7da; color: black'
+            return ''
 
-            # MÉTRICAS
-            st.markdown("### 📊 Métricas de Poder")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Ataque Local", f"{f_atq_l:.2f}")
-            m2.metric("Defensa Local", f"{f_def_l:.2f}", delta_color="inverse")
-            m3.metric("Ataque Visita", f"{f_atq_v:.2f}")
-            m4.metric("Defensa Visita", f"{f_def_v:.2f}", delta_color="inverse")
+        st.table(df_res.style.map(colorear, subset=['¿Apostar?']))
 
-            # TABLA DE DECISIÓN
-            st.markdown("### 🏆 Decisión de Inversión")
-            datos = {
-                "Opción": [local, "Empate", visitante],
-                "Prob Real": [f"{probs['local']*100:.1f}%", f"{probs['empate']*100:.1f}%", f"{probs['visitante']*100:.1f}%"],
-                "Cuota": [f"{odds_l:.2f}", f"{odds_e:.2f}", f"{odds_v:.2f}"],
-                "Valor (EV)": [f"{val_l:.2f}%", f"{val_e:.2f}%", f"{val_v:.2f}%"],
-                "¿Apostar?": [dec_l, dec_e, dec_v]
-            }
-            
-            # ESTILIZADO CONDICIONAL DE PANDAS
-            df_res = pd.DataFrame(datos)
-            def color_filas(val):
-                color = '#d4edda' if '✅' in str(val) else '#f8d7da' if '⛔' in str(val) else ''
-                return f'background-color: {color}'
-            
-            st.dataframe(df_res.style.map(color_filas, subset=['¿Apostar?']), use_container_width=True)
-
-            # RECOMENDACIÓN FINAL
-            mejor = max([(val_l, local), (val_e, "Empate"), (val_v, visitante)])
-            if mejor[0] > 0:
-                st.success(f"💎 **Oportunidad:** {mejor[1]} (Valor: +{mejor[0]:.2f}%)")
-            else:
-                st.warning("⚠️ No hay valor en este mercado.")
-
-    except Exception as e:
-        st.error(f"Error: {e}")
+        # Mensaje destacado
+        mejor_ev = max(ev_l, ev_e, ev_v)
+        if mejor_ev > 0:
+            st.balloons()
+            st.success(f"💎 **OPORTUNIDAD DETECTADA:** Hay valor positivo de +{mejor_ev:.2f}% en este mercado.")
+        else:
+            st.warning("⚠️ El mercado está bien ajustado o las cuotas son bajas. No hay valor matemático.")
