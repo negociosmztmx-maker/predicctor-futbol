@@ -45,6 +45,8 @@ def convertir_cuota(valor):
 def cargar_desde_api(liga_code):
     """Conecta a football-data.org y devuelve un DataFrame limpio."""
     try:
+        # --- CORRECCIÓN CRÍTICA DE SINTAXIS ---
+        # Buscamos la clave en el archivo secrets.toml usando corchetes
         api_key = st.secrets["FOOTBALL_API_KEY"]
     except FileNotFoundError:
         return None, "❌ Falta configurar .streamlit/secrets.toml"
@@ -208,9 +210,13 @@ else:
     # 2. CUOTAS
     st.markdown("### 💰 Cuotas del Mercado")
     c1, c2, c3 = st.columns(3)
-    cuota_l_raw = c1.number_input(f"Cuota {local}", 0.0, step=0.1)
-    cuota_e_raw = c2.number_input("Cuota Empate", 0.0, step=0.1)
-    cuota_v_raw = c3.number_input(f"Cuota {visitante}", 0.0, step=0.1)
+    
+    # --- CORRECCIÓN INPUT NEGATIVO ---
+    # Quitamos el límite de min_value=0.0 para permitir cuotas negativas (Americanas)
+    # Establecemos un rango amplio: de -10,000 a +10,000
+    cuota_l_raw = c1.number_input(f"Cuota {local}", value=0.0, step=10.0, min_value=-10000.0, max_value=10000.0)
+    cuota_e_raw = c2.number_input("Cuota Empate", value=0.0, step=10.0, min_value=-10000.0, max_value=10000.0)
+    cuota_v_raw = c3.number_input(f"Cuota {visitante}", value=0.0, step=10.0, min_value=-10000.0, max_value=10000.0)
 
     # 3. BOTÓN DE ANÁLISIS
     if st.button("🚀 Calcular Probabilidades y Valor", type="primary"):
